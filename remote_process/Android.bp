@@ -1,0 +1,54 @@
+cc_library_shared {
+  name: "libaflclient",
+  compile_multilib: "64",
+  vendor_available: true,
+  host_supported: true,
+
+  header_libs: [
+    "libafl_headers",
+  ],
+
+  srcs: [
+    "aflclient.c"
+  ],
+
+  cflags: [
+    "-g",
+    "-O0",
+    "-Wall",
+  ],
+}
+
+cc_binary {
+  name: "aflserver",
+  host_supported: true,
+
+  srcs: [
+    "server.c"
+  ],
+
+  cflags: [
+    "-g",
+    "-O0",
+    "-Wall",
+  ],
+}
+
+cc_binary {
+  name: "aflclient",
+  host_supported: true,
+
+  srcs: [
+    "client.c"
+  ],
+
+  cflags: [
+    "-g",
+    "-O0",
+    "-Wall",
+  ],
+
+  shared_libs: [
+    "libaflclient",
+  ],
+}

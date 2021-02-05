@@ -39,6 +39,8 @@
 #endif
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #if !__GNUC__
   #include "llvm/Config/llvm-config.h"
@@ -121,6 +123,27 @@ static u8 is_persistent;
 /* Are we in sancov mode? */
 
 static u8 _is_sancov;
+
+/* Remote process */
+
+#define AFL_SOCK_SUFFIX     "AFL_SOCK_SUFFIX"
+#define AFL_DEBUG           "AFL_DEBUG"
+#define AFL_NO_REMOTE       "AFL_NO_REMOTE"
+#define AFL_REMOTE_SKIP_COUNT    "AFL_REMOTE_SKIP_COUNT"
+static s32 shm_id = -1;
+static s32 server_pid = -1,
+           client_pid = -1;
+char* tmpdir;
+static u8 first_pass = 1;
+static u8 loop_continue = 0;
+static u8 __afl_loop_flag = 0;
+static char afl_debug = 0;
+static struct sockaddr_un addr;
+static char sock_str[1024];
+static int sock_fd;
+static int afl_sock_fd;
+static unsigned int afl_remote_skip_count = 0;
+static unsigned int loop_count = 0;
 
 /* ensure we kill the child on termination */
 
@@ -1725,3 +1748,210 @@ void __afl_coverage_interesting(u8 val, u32 id) {
 
 }
 
+// remote process things
+void setup_shm(void) {
+  char shm_str[11];
+
+  if (shm_id != -1) {
+#ifdef __ANDROID__
+    shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+#endif
+
+    snprintf(shm_str, sizeof(shm_str), "%d", shm_id);
+    if (!getenv("AFL_DUMB_MODE")) setenv(SHM_ENV_VAR, shm_str, 1);
+
+    __afl_map_shm();
+  } else if (afl_debug && shm_id == -1) {
+    shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+
+    snprintf(shm_str, sizeof(shm_str), "%d", shm_id);
+    if (!getenv("AFL_DUMB_MODE")) setenv(SHM_ENV_VAR, shm_str, 1);
+
+    __afl_map_shm();
+  }
+}
+
+void handle_sig(int sig) {
+  dprintf(2, "sig=%d, client_pid=%d\n", sig, client_pid);
+  if (client_pid != -1) {
+    // send trace_bits to client in case crash
+    if (getenv(AFL_NO_REMOTE)) return;
+
+    u8 tmp[4];
+
+    memset(tmp, 0, 4);
+    if (recv(afl_sock_fd, tmp, 4, MSG_WAITALL) != 4) goto error;
+
+#ifdef __ANDROID__
+    if (shm_id != -1) {
+      if (send(afl_sock_fd, __afl_area_ptr, MAP_SIZE, 0) != MAP_SIZE) goto error;
+      if (recv(afl_sock_fd, tmp, 4, MSG_WAITALL) != 4) goto error;
+      FILE *fp;
+      char* file = getenv("AFL_TRACE_BITS_FILE");
+      if (file) {
+        fp = fopen(file, "wb");
+        fwrite(__afl_area_ptr, MAP_SIZE, 1, fp);
+        fclose(fp);
+      }
+    }
+#endif
+
+error:
+    close(afl_sock_fd);
+    close(sock_fd);
+
+    kill(client_pid, sig);
+  }
+}
+
+void setup_signal_handlers(void) {
+  signal(SIGABRT, handle_sig);
+  signal(SIGFPE, handle_sig);
+  signal(SIGSEGV, handle_sig);
+//  sigaction(SIGTERM, &sa, NULL);
+  signal(SIGPIPE, SIG_IGN);
+}
+
+__attribute__((constructor))
+void setup_afl_server() {
+  if (getenv(AFL_DEBUG)) afl_debug = 1;
+  if (getenv(AFL_NO_REMOTE)) return;
+  if (getenv(AFL_REMOTE_SKIP_COUNT)) afl_remote_skip_count = (unsigned int)atol(getenv(AFL_REMOTE_SKIP_COUNT));
+
+  setup_signal_handlers();
+
+  tmpdir = getenv("TMPDIR");
+  if (!tmpdir) tmpdir = "/tmp";
+
+  char *sock_suffix = getenv(AFL_SOCK_SUFFIX);
+  if (sock_suffix)
+    snprintf(sock_str, sizeof(sock_str), "%s/afl_sock_%s", tmpdir, sock_suffix);
+  else
+    snprintf(sock_str, sizeof(sock_str), "%s/afl_sock", tmpdir);
+
+  unlink(sock_str);
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, sock_str, sizeof(addr.sun_path));
+
+  if ((sock_fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+    perror("socket create failed");
+    _exit(EXIT_FAILURE);
+  }
+
+  unsigned int addrlen = sizeof(addr);
+  if (bind(sock_fd, (struct sockaddr*)&addr, addrlen) < 0) {
+    perror("socket bind failed");
+    close(sock_fd);
+    _exit(EXIT_FAILURE);
+  }
+
+  if (listen(sock_fd, 8) < 0) {
+    perror("socket listen failed");
+    close(sock_fd);
+    _exit(EXIT_FAILURE);
+  }
+}
+
+int afl_remote_loop_start(void) {
+  if (afl_debug) printf("afl_remote_loop_start\n");
+  if (getenv(AFL_NO_REMOTE)) return 0;
+
+  if (loop_count < afl_remote_skip_count) return 0;
+  if (loop_continue) {
+    if (afl_debug) printf("afl_remote_loop_continue\n");
+    loop_continue = 0;
+    return 0;
+  }
+
+  unsigned int addrlen = sizeof(addr);
+//LOOP:
+  if ((afl_sock_fd=accept(sock_fd, (struct sockaddr*)&addr, &addrlen)) < 0) {
+    perror("socket accept failed");
+    close(sock_fd);
+    _exit(1);
+//    setup_afl_server();
+//    goto LOOP;
+  }
+
+  if (recv(afl_sock_fd, &shm_id, 4, MSG_WAITALL) != 4) goto error;
+
+  if (first_pass) setup_shm();
+
+  first_pass = 0;
+
+  server_pid = getpid();
+  if (send(afl_sock_fd, &server_pid, 4, 0) != 4) goto error;
+
+  if (recv(afl_sock_fd, &client_pid, 4, MSG_WAITALL) != 4) goto error;
+
+  return 0;
+
+error:
+  close(afl_sock_fd);
+  close(sock_fd);
+  return 1;
+}
+
+int afl_remote_loop_next(void) {
+  if (afl_debug) printf("afl_remote_loop_next\n");
+  if (getenv(AFL_NO_REMOTE)) return 0;
+  if (loop_count < afl_remote_skip_count) {
+    loop_count++;
+    return 0;
+  }
+
+  u8 tmp[4];
+
+  memset(tmp, 0, 4);
+  if (recv(afl_sock_fd, tmp, 4, MSG_WAITALL) != 4) goto error;
+
+  if (!memcmp(tmp, "CONT", 4)) {
+    loop_continue = 1;
+    return 0;
+  }
+
+#ifdef __ANDROID__
+  if (shm_id != -1) {
+    if (send(afl_sock_fd, __afl_area_ptr, MAP_SIZE, 0) != MAP_SIZE) goto error;
+    if (recv(afl_sock_fd, tmp, 4, MSG_WAITALL) != 4) goto error;
+  }
+#endif
+//  __afl_area_ptr = __afl_area_initial;
+
+  close(afl_sock_fd);
+  return 0;
+
+error:
+  close(afl_sock_fd);
+  close(sock_fd);
+  return 1;
+}
+
+int afl_remote_loop(void) {
+  if (getenv(AFL_NO_REMOTE)) return 1;
+
+LOOP_BEGIN:
+  if (!__afl_loop_flag) {
+
+    if(afl_remote_loop_start()) goto error;
+    __afl_loop_flag = 1;
+
+  } else {
+
+    if (afl_remote_loop_next()) goto error;
+    __afl_loop_flag = 0;
+    goto LOOP_BEGIN;
+
+  }
+
+  return 1;
+
+error:
+  __afl_loop_flag = 0;
+  goto LOOP_BEGIN;
+}
+
+void afl_remote_set_loop_continue(int flag) {
+  loop_continue = flag;
+}

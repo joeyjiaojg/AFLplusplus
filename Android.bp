@@ -271,4 +271,5 @@ cc_binary {
 
 subdirs = [
   "custom_mutators",
+  "remote_process",
 ]
