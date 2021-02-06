@@ -16,10 +16,11 @@ cc_library_shared {
     "-g",
     "-O0",
     "-Wall",
+    "-Wno-unused-parameter",
   ],
 }
 
-cc_binary {
+/*cc_binary {
   name: "aflserver",
   host_supported: true,
 
@@ -32,7 +33,7 @@ cc_binary {
     "-O0",
     "-Wall",
   ],
-}
+}*/
 
 cc_binary {
   name: "aflclient",
