@@ -1666,17 +1666,21 @@ static u8 cmp_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
 
       if (afl->pass_stats[key].total == 0) {
 
+#ifdef WORD_SIZE_64
         if (unlikely(is_n)) {
 
           try_to_add_to_dictN(afl, s128_v0, SHAPE_BYTES(h->shape));
           try_to_add_to_dictN(afl, s128_v1, SHAPE_BYTES(h->shape));
 
         } else {
+#endif
 
           try_to_add_to_dict(afl, o->v0, SHAPE_BYTES(h->shape));
           try_to_add_to_dict(afl, o->v1, SHAPE_BYTES(h->shape));
 
+#ifdef WORD_SIZE_64
         }
+#endif
 
       }
 
@@ -2528,8 +2532,8 @@ exit_its:
     }
 
   #else
-    u32 *v = (u64 *)afl->virgin_bits;
-    u32 *s = (u64 *)virgin_save;
+    u32 *v = (u32 *)afl->virgin_bits;
+    u32 *s = (u32 *)virgin_save;
     u32 i;
     for (i = 0; i < (afl->shm.map_size >> 2); i++) {
 
